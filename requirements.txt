@@ -1,4 +1,6 @@
 streamlit
 supabase
-pyzbar
 opencv-python-headless
+pyzbar
+pandas
+numpy
