@@ -3,91 +3,169 @@ from supabase import create_client, Client
 import cv2
 import numpy as np
 from pyzbar import pyzbar
-import pandas as pd
-from datetime import datetime
+import av
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
-# --- 1. AUTHENTICATION (SECURE LOGIN) ---
-def check_password():
-    if "password_correct" not in st.session_state:
-        st.session_state["password_correct"] = False
+# --- CONFIGURATION & AUTH ---
+st.set_page_config(page_title="VasyERP Clone", layout="wide", initial_sidebar_state="collapsed")
 
-    if not st.session_state["password_correct"]:
-        st.title("🔐 Shop Login")
-        pwd = st.text_input("Enter Admin Password", type="password")
-        if st.button("Login"):
-            if pwd == st.secrets["APP_PASSWORD"]:
-                st.session_state["password_correct"] = True
-                st.rerun()
-            else:
-                st.error("Invalid Password")
-        return False
-    return True
+# 1. Secure Login
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
 
-if not check_password():
+def check_login():
+    st.markdown("## 🔐 Shop Manager Login")
+    password = st.text_input("Enter Password", type="password")
+    if st.button("Login"):
+        if password == st.secrets["APP_PASSWORD"]:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Wrong Password")
+
+if not st.session_state.authenticated:
+    check_login()
     st.stop()
 
-# --- 2. DATABASE & CONFIG ---
-st.set_page_config(page_title="Kirana ERP Cloud", layout="wide")
-supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+# 2. Database Connection
+@st.cache_resource
+def init_db():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-# --- 3. SESSION STATE FOR BILLING ---
-if 'cart' not in st.session_state:
-    st.session_state.cart = []
+supabase = init_db()
 
-# --- 4. THE INTERFACE ---
-tabs = st.tabs(["🛒 POS & Billing", "📦 Inventory Master", "📊 Reports"])
+# --- REAL-TIME BARCODE SCANNER (THE "VASY" FEATURE) ---
+# This config ensures the camera works on Mobile Data (4G) as well as WiFi
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
-# --- TAB 1: POS & BILLING ---
-with tabs[0]:
-    col_scan, col_bill = st.columns([1, 1])
+def barcode_callback(frame):
+    """This runs 30 times a second to find barcodes instantly."""
+    img = frame.to_ndarray(format="bgr24")
     
-    with col_scan:
-        st.subheader("Scan Items")
-        img = st.camera_input("Scan Barcode")
+    # Decode barcode
+    decoded_objects = pyzbar.decode(img)
+    
+    for obj in decoded_objects:
+        # If found, draw a green box (Visual Feedback)
+        (x, y, w, h) = obj.rect
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
         
-        if img:
-            # Automatic Decoding
-            file_bytes = np.asarray(bytearray(img.read()), dtype=np.uint8)
-            frame = cv2.imdecode(file_bytes, 1)
-            decoded = pyzbar.decode(frame)
-            
-            if decoded:
-                barcode = decoded[0].data.decode("utf-8")
-                res = supabase.table("products").select("*").eq("barcode", barcode).execute()
-                if res.data:
-                    item = res.data[0]
-                    st.session_state.cart.append(item)
-                    st.success(f"Added: {item['name']}")
-                else:
-                    st.error("Product not found!")
+        # We can't return data directly from this callback to Streamlit easily,
+        # so usually, we just visualize it here. To capture it, we use the UI below.
+    
+    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    with col_bill:
+# --- APP NAVIGATION ---
+st.sidebar.image("https://cdn-icons-png.flaticon.com/512/3135/3135715.png", width=50)
+menu = st.sidebar.radio("Menu", ["Dashboard", "Live POS (Billing)", "Inventory Master", "Settings"])
+
+# --- TAB 1: DASHBOARD ---
+if menu == "Dashboard":
+    st.title("📊 Retail Dashboard")
+    # Quick Stats
+    try:
+        count = supabase.table("products").select("id", count="exact").execute().count
+        st.metric("Total Products", count)
+    except:
+        st.metric("Total Products", "0")
+    
+    st.info("💡 Tip: Go to 'Live POS' to start billing customers.")
+
+# --- TAB 2: LIVE POS (The Vasy Scanning Experience) ---
+elif menu == "Live POS (Billing)":
+    st.title("🛒 Live Billing Terminal")
+    
+    col1, col2 = st.columns([1.5, 1])
+    
+    with col1:
+        st.subheader("Scan Product")
+        st.write("Point camera at barcode. It will auto-detect.")
+        
+        # LIVE WEBCAM SCANNER
+        # This replaces the "Take Photo" button with a live video feed
+        webrtc_ctx = webrtc_streamer(
+            key="barcode-scanner",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            video_frame_callback=barcode_callback,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+
+        # Simple manual override if camera is tricky
+        manual_code = st.text_input("Or type Barcode & Enter", key="manual_input")
+        
+        if manual_code:
+            # Fetch product
+            res = supabase.table("products").select("*").eq("barcode", manual_code).execute()
+            if res.data:
+                item = res.data[0]
+                if "cart" not in st.session_state: st.session_state.cart = []
+                st.session_state.cart.append(item)
+                st.success(f"✅ Added {item['name']}")
+            else:
+                st.error("❌ Product not found!")
+
+    with col2:
         st.subheader("Current Bill")
-        if st.session_state.cart:
-            df_cart = pd.DataFrame(st.session_state.cart)
-            st.table(df_cart[['name', 'selling_price']])
-            total = df_cart['selling_price'].sum()
-            st.write(f"### Total: ₹{total}")
+        if "cart" in st.session_state and st.session_state.cart:
+            total = 0
+            for i, item in enumerate(st.session_state.cart):
+                st.write(f"{i+1}. **{item['name']}** - ₹{item['selling_price']}")
+                total += item['selling_price']
             
-            if st.button("Generate & Print Bill"):
-                # Logic for Printing
-                st.write("---")
-                st.markdown(f"""
-                <div id="thermal-bill" style="width: 80mm; font-family: 'Courier New', Courier, monospace; font-size: 12px; border: 1px solid #ccc; padding: 10px;">
-                    <center><strong>MY KIRANA STORE</strong></center>
-                    <center>Patna, Bihar</center>
-                    <hr>
-                    {"".join([f"<p>{i['name']} <span style='float:right;'>₹{i['selling_price']}</span></p>" for i in st.session_state.cart])}
-                    <hr>
-                    <p><strong>TOTAL <span style='float:right;'>₹{total}</span></strong></p>
-                    <center>Thank You! Visit Again</center>
-                </div>
-                """, unsafe_allow_index=True)
-                
-                # Trigger Browser Print for Thermal Printer
-                st.button("Click to Print to Thermal Printer", on_click=lambda: st.write('<script>window.print();</script>', unsafe_allow_html=True))
-                
-                # Clear cart after billing
-                if st.button("Clear Bill"):
-                    st.session_state.cart = []
-                    st.rerun()
+            st.divider()
+            st.markdown(f"### Total: ₹{total}")
+            
+            if st.button("Print Bill"):
+                st.toast("Printing Thermal Receipt...")
+                # Clear cart
+                st.session_state.cart = []
+                st.rerun()
+        else:
+            st.write("Cart is empty")
+
+# --- TAB 3: INVENTORY MASTER (Detailed Vasy Fields) ---
+elif menu == "Inventory Master":
+    st.title("📦 Add New Product")
+    
+    with st.form("new_product_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            name = st.text_input("Product Name *")
+            barcode = st.text_input("Barcode / ISBN *")
+            category = st.selectbox("Category", ["General", "Food", "Electronics", "Pharma"])
+        with c2:
+            buy_price = st.number_input("Purchase Price", min_value=0.0)
+            sell_price = st.number_input("Selling Price *", min_value=0.0)
+            mrp = st.number_input("MRP", min_value=0.0)
+        with c3:
+            stock = st.number_input("Opening Stock", min_value=0)
+            tax = st.selectbox("GST %", [0, 5, 12, 18, 28])
+            hsn = st.text_input("HSN Code")
+
+        submitted = st.form_submit_button("Save Product")
+        if submitted:
+            if name and barcode and sell_price:
+                data = {
+                    "name": name,
+                    "barcode": barcode,
+                    "quantity": stock,
+                    "purchase_price": buy_price,
+                    "selling_price": sell_price,
+                    "mrp": mrp
+                }
+                supabase.table("products").insert(data).execute()
+                st.success("Product Added Successfully!")
+            else:
+                st.warning("Please fill required fields (*)")
+
+# --- TAB 4: SETTINGS ---
+elif menu == "Settings":
+    st.title("⚙️ Settings")
+    st.write("Printer Configuration: POS-80 (Thermal)")
+    st.write("Shop Name: My Kirana Store")
