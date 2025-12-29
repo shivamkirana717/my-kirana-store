@@ -1,81 +1,93 @@
 import streamlit as st
-import numpy as np
-import cv2
-from pyzbar import pyzbar
 from supabase import create_client, Client
-from PIL import Image
+import cv2
+import numpy as np
+from pyzbar import pyzbar
+import pandas as pd
+from datetime import datetime
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Kirana Cloud Manager", layout="wide")
+# --- 1. AUTHENTICATION (SECURE LOGIN) ---
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
 
-# Connect to Supabase
-url = st.secrets["SUPABASE_URL"]
-key = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(url, key)
-
-# --- NAVIGATION ---
-menu = st.sidebar.radio("Main Menu", ["Dashboard", "Scan & Sell", "Add New Product", "Inventory List"])
-
-# --- BARCODE DECODER FUNCTION ---
-def decode_barcode(image_buffer):
-    """Automatically finds and reads a barcode from an image buffer."""
-    file_bytes = np.asarray(bytearray(image_buffer.read()), dtype=np.uint8)
-    opencv_image = cv2.imdecode(file_bytes, 1)
-    barcodes = pyzbar.decode(opencv_image)
-    
-    for barcode in barcodes:
-        return barcode.data.decode("utf-8")
-    return None
-
-# --- PAGE: SCAN & SELL ---
-if menu == "Scan & Sell":
-    st.header("🔍 Quick Scan")
-    cam_input = st.camera_input("Point at a product barcode")
-
-    if cam_input:
-        barcode_data = decode_barcode(cam_input)
-        if barcode_data:
-            st.success(f"Barcode Detected: {barcode_data}")
-            # Search Supabase for this product
-            res = supabase.table("products").select("*").eq("barcode", barcode_data).execute()
-            if res.data:
-                p = res.data[0]
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"**Product:** {p['name']}")
-                    st.write(f"**Price:** ₹{p['selling_price']}")
-                with col2:
-                    new_qty = st.number_input("Update Stock", value=p['quantity'])
-                    if st.button("Save Update"):
-                        supabase.table("products").update({"quantity": new_qty}).eq("id", p['id']).execute()
-                        st.balloons()
+    if not st.session_state["password_correct"]:
+        st.title("🔐 Shop Login")
+        pwd = st.text_input("Enter Admin Password", type="password")
+        if st.button("Login"):
+            if pwd == st.secrets["APP_PASSWORD"]:
+                st.session_state["password_correct"] = True
+                st.rerun()
             else:
-                st.warning("Product not found. Would you like to add it?")
-                if st.button("Create New Product"):
-                    st.session_state.new_barcode = barcode_data
-                    # Redirect logic here
-        else:
-            st.error("Could not read barcode. Please try again with better lighting.")
+                st.error("Invalid Password")
+        return False
+    return True
 
-# --- PAGE: INVENTORY LIST ---
-elif menu == "Inventory List":
-    st.header("📦 Current Stock")
-    res = supabase.table("products").select("*").execute()
-    if res.data:
-        st.dataframe(res.data, use_container_width=True)
-    else:
-        st.info("No data found.")
+if not check_password():
+    st.stop()
 
-# --- PAGE: ADD PRODUCT ---
-elif menu == "Add New Product":
-    st.header("➕ Add Item")
-    with st.form("add_form"):
-        name = st.text_input("Product Name")
-        barcode = st.text_input("Barcode", value=st.session_state.get('new_barcode', ""))
-        qty = st.number_input("Initial Quantity", min_value=0)
-        sp = st.number_input("Selling Price", min_value=0.0)
-        submitted = st.form_submit_button("Add to Cloud")
+# --- 2. DATABASE & CONFIG ---
+st.set_page_config(page_title="Kirana ERP Cloud", layout="wide")
+supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+# --- 3. SESSION STATE FOR BILLING ---
+if 'cart' not in st.session_state:
+    st.session_state.cart = []
+
+# --- 4. THE INTERFACE ---
+tabs = st.tabs(["🛒 POS & Billing", "📦 Inventory Master", "📊 Reports"])
+
+# --- TAB 1: POS & BILLING ---
+with tabs[0]:
+    col_scan, col_bill = st.columns([1, 1])
+    
+    with col_scan:
+        st.subheader("Scan Items")
+        img = st.camera_input("Scan Barcode")
         
-        if submitted:
-            supabase.table("products").insert({"name": name, "barcode": barcode, "quantity": qty, "selling_price": sp}).execute()
-            st.success("Product added successfully!")
+        if img:
+            # Automatic Decoding
+            file_bytes = np.asarray(bytearray(img.read()), dtype=np.uint8)
+            frame = cv2.imdecode(file_bytes, 1)
+            decoded = pyzbar.decode(frame)
+            
+            if decoded:
+                barcode = decoded[0].data.decode("utf-8")
+                res = supabase.table("products").select("*").eq("barcode", barcode).execute()
+                if res.data:
+                    item = res.data[0]
+                    st.session_state.cart.append(item)
+                    st.success(f"Added: {item['name']}")
+                else:
+                    st.error("Product not found!")
+
+    with col_bill:
+        st.subheader("Current Bill")
+        if st.session_state.cart:
+            df_cart = pd.DataFrame(st.session_state.cart)
+            st.table(df_cart[['name', 'selling_price']])
+            total = df_cart['selling_price'].sum()
+            st.write(f"### Total: ₹{total}")
+            
+            if st.button("Generate & Print Bill"):
+                # Logic for Printing
+                st.write("---")
+                st.markdown(f"""
+                <div id="thermal-bill" style="width: 80mm; font-family: 'Courier New', Courier, monospace; font-size: 12px; border: 1px solid #ccc; padding: 10px;">
+                    <center><strong>MY KIRANA STORE</strong></center>
+                    <center>Patna, Bihar</center>
+                    <hr>
+                    {"".join([f"<p>{i['name']} <span style='float:right;'>₹{i['selling_price']}</span></p>" for i in st.session_state.cart])}
+                    <hr>
+                    <p><strong>TOTAL <span style='float:right;'>₹{total}</span></strong></p>
+                    <center>Thank You! Visit Again</center>
+                </div>
+                """, unsafe_allow_index=True)
+                
+                # Trigger Browser Print for Thermal Printer
+                st.button("Click to Print to Thermal Printer", on_click=lambda: st.write('<script>window.print();</script>', unsafe_allow_html=True))
+                
+                # Clear cart after billing
+                if st.button("Clear Bill"):
+                    st.session_state.cart = []
+                    st.rerun()
