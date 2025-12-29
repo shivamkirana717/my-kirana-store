@@ -5,8 +5,8 @@ from supabase import create_client, Client
 st.set_page_config(page_title="Shop Manager Web", layout="wide")
 
 # Connect to Supabase using Streamlit Secrets
-url = st.secrets["https://ogmbktmlaucnfzvswbvq.supabase.co"]
-key = st.secrets["sb_publishable_IGcEXTZNiF9Xp3F6sZsrsw_oen7HYl3"]
+url = st.secrets["SUPABASE_URL"]
+key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 st.title("📦 Live Shop Inventory")
